@@ -1,0 +1,119 @@
+name: Build ImGui Linux ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      VCPKG_DEFAULT_TRIPLET: arm64-linux
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-linux
+      VCPKG_MAX_CONCURRENCY: 2
+    steps:
+      - name: Get matching plugin source
+        uses: actions/checkout@v4
+        with:
+          repository: pkdawson/imgui-godot
+          ref: v6.2.1
+          submodules: recursive
+          path: upstream
+
+      - name: Get matching dependency manager
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: 1de2026f28ead93ff1773e6e680387643e914ea1
+          path: vcpkg
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            build-essential cmake ninja-build pkg-config autoconf automake libtool \
+            clang-format curl zip unzip tar python3-pip
+          python3 -m pip install 'scons==4.7.0' 'ply==3.11'
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Configure ARM64 compiler and dependencies
+        working-directory: upstream/gdext
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('SConstruct')
+          text = p.read_text()
+          old = 'triplet = "x64-linux"'
+          assert text.count(old) == 1, 'Unexpected plugin build script'
+          text = text.replace(old, 'triplet = "arm64-linux"')
+          old = 'subprocess.call("$VCPKG_ROOT/vcpkg install", shell=True)'
+          assert old in text
+          text = text.replace(old, 'subprocess.check_call("$VCPKG_ROOT/vcpkg install --triplet arm64-linux --host-triplet x64-linux", shell=True)')
+          p.write_text(text)
+
+          # Apply the compiler before godot-cpp creates its compilation nodes.
+          p = Path('godot-cpp/SConstruct')
+          text = p.read_text()
+          old = 'cpp_tool.generate(env)'
+          assert text.count(old) == 1, 'Unexpected godot-cpp build script'
+          text = text.replace(old, '''env.Replace(CC="aarch64-linux-gnu-gcc",
+              CXX="aarch64-linux-gnu-g++", LINK="aarch64-linux-gnu-g++",
+              AR="aarch64-linux-gnu-ar", RANLIB="aarch64-linux-gnu-ranlib")
+          cpp_tool.generate(env)''')
+          p.write_text(text)
+          PY
+
+      - name: Build Debug and Release libraries
+        working-directory: upstream/gdext
+        run: |
+          scons -j2 platform=linux arch=arm64 precision=single target=template_debug godot-cpp
+          scons -j2 platform=linux arch=arm64 precision=single target=template_debug
+          scons -j2 platform=linux arch=arm64 precision=single target=template_release godot-cpp
+          scons -j2 platform=linux arch=arm64 precision=single target=template_release
+
+      - name: Check and package libraries
+        run: |
+          mkdir -p package/addons/imgui-godot/bin
+          for mode in debug release; do
+            lib="upstream/addons/imgui-godot/bin/libimgui-godot-native.linux.$mode.arm64.so"
+            test -s "$lib"
+            file "$lib"
+            aarch64-linux-gnu-readelf -h "$lib" | grep -q 'Machine:.*AArch64'
+            aarch64-linux-gnu-nm -D --defined-only "$lib" | grep -q ' ign_init$'
+            cp "$lib" package/addons/imgui-godot/bin/
+            aarch64-linux-gnu-readelf -d "$lib" >> package/library-dependencies.txt
+            aarch64-linux-gnu-readelf --version-info "$lib" >> package/library-symbol-versions.txt
+          done
+          cp upstream/LICENSE package/IMGUI-GODOT-LICENSE.txt
+          cp upstream/gdext/imgui/LICENSE.txt package/IMGUI-LICENSE.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path('upstream/gdext/imgui-godot-native.gdextension').read_text()
+          assert '[libraries]' in text
+          for mode in ('debug', 'release'):
+              text += f'\nlinux.{mode}.arm64 = "bin/libimgui-godot-native.linux.{mode}.arm64.so"\n'
+          Path('package/addons/imgui-godot/imgui-godot-native.gdextension').write_text(text)
+          Path('package/INSTALL.txt').write_text(
+              'For imgui-godot 6.2.1 / ImGui 1.91.0 / standard single-precision Godot.\n'
+              'Merge the addons directory into your Godot project; replace the .gdextension file.\n'
+              'Enable ImGui Debug and Release in the Linux ARM64 export preset.\n'
+              'Export again, and copy the WHOLE exported directory to the target machine.\n'
+              'Built on Ubuntu 22.04 with its ARM64 cross toolchain.\n'
+              'Check library-symbol-versions.txt against target glibc/libstdc++ versions.\n'
+              'These build checks do not confirm runtime compatibility with Kylin.\n'
+          )
+          PY
+          (cd package && sha256sum addons/imgui-godot/bin/*.so > SHA256SUMS.txt)
+
+      - name: Download this artifact after the build succeeds
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgui-godot-6.2.1-linux-arm64
+          path: package/
+          if-no-files-found: error
+          retention-days: 14
